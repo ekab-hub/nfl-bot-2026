@@ -1,0 +1,220 @@
+--- a/season_sim_core.py
++++ b/season_sim_core.py
+@@ -66,7 +66,22 @@
+     return df.sort(["week"]).select(cols).to_dicts()
+ 
+ 
+-def simulate_one_season(preseason_ratings, schedule, k=20, home_advantage=35, margin_std=13.5):
++def apply_elo_adjustments(ratings, elo_adjustments=None):
++    """Elo + desplazamiento por equipo (para playoffs). Sin ajustes devuelve el mismo dict."""
++    if not elo_adjustments:
++        return ratings
++    return {team: r + elo_adjustments.get(team, 0.0) for team, r in ratings.items()}
++
++
++def simulate_one_season(preseason_ratings, schedule, k=20, home_advantage=35, margin_std=13.5,
++                        elo_adjustments=None):
++    """
++    elo_adjustments: dict opcional equipo -> puntos de Elo (negativo = penalizacion, p.ej.
++    QB fuera por la temporada; ver qb_out_2026.py). Solo afecta partidos SIN resultado real:
++    se suma al calcular el margen esperado (y la expectativa de la actualizacion, para que
++    el Elo simulado no absorba la penalizacion y la cuente dos veces). El rating guardado y
++    devuelto nunca incluye el desplazamiento.
++    """
+     engine = EloEngine(k=k, home_advantage=home_advantage)
+     engine.ratings = dict(preseason_ratings)
+ 
+@@ -77,11 +92,15 @@
+         home, away = game["home_team"], game["away_team"]
+         played = game.get("home_score") is not None and game.get("away_score") is not None
+ 
++        adj_home = adj_away = 0.0
+         if played:
+             home_score, away_score = int(game["home_score"]), int(game["away_score"])
+         else:
+-            r_home = engine.get_rating(home) + engine.home_advantage
+-            r_away = engine.get_rating(away)
++            if elo_adjustments:
++                adj_home = elo_adjustments.get(home, 0.0)
++                adj_away = elo_adjustments.get(away, 0.0)
++            r_home = engine.get_rating(home) + engine.home_advantage + adj_home
++            r_away = engine.get_rating(away) + adj_away
+             expected_margin = (r_home - r_away) / 25.0
+             actual_margin = np.random.normal(expected_margin, margin_std)
+             home_score = max(0, round(20 + actual_margin / 2))
+@@ -89,7 +108,14 @@
+             if home_score == away_score:
+                 home_score += 1
+ 
+-        engine.update_game(home, away, home_score, away_score)
++        if adj_home or adj_away:
++            engine.ratings[home] = engine.get_rating(home) + adj_home
++            engine.ratings[away] = engine.get_rating(away) + adj_away
++            engine.update_game(home, away, home_score, away_score)
++            engine.ratings[home] -= adj_home
++            engine.ratings[away] -= adj_away
++        else:
++            engine.update_game(home, away, home_score, away_score)
+ 
+         for team, pf, pa in [(home, home_score, away_score), (away, away_score, home_score)]:
+             records[team]["pf"] += pf
+--- a/division_champions.py
++++ b/division_champions.py
+@@ -7,12 +7,15 @@
+ import polars as pl
+ from season_sim_core import (get_preseason_ratings, get_season_schedule, simulate_one_season,
+                               get_all_division_winners, TEAM_TO_DIVISION, IN_SEASON_K, PRESEASON_K)
++from qb_out_2026 import qb_elo_adjustments
+ 
+ 
+ def run_division_monte_carlo(target_season, n_sims=10000, use_played=False):
+     preseason_ratings = get_preseason_ratings(target_season)
+     schedule = get_season_schedule(target_season, include_played_results=use_played)
+     k = IN_SEASON_K if use_played else PRESEASON_K
++    # QB fuera por la temporada: solo en vivo (use_played=True); backtests sin cambios
++    elo_adjustments = qb_elo_adjustments(target_season) if use_played else {}
+ 
+     if use_played:
+         n_played = sum(1 for g in schedule if g.get("home_score") is not None)
+@@ -21,7 +24,7 @@
+     division_wins = {team: 0 for team in TEAM_TO_DIVISION}
+ 
+     for _ in range(n_sims):
+-        records, _ = simulate_one_season(preseason_ratings, schedule, k=k)
++        records, _ = simulate_one_season(preseason_ratings, schedule, k=k, elo_adjustments=elo_adjustments)
+         winners = get_all_division_winners(records)
+         for winner in winners.values():
+             division_wins[winner] += 1
+--- a/superbowl_champions.py
++++ b/superbowl_champions.py
+@@ -7,13 +7,16 @@
+ import polars as pl
+ from season_sim_core import (get_preseason_ratings, get_season_schedule, simulate_one_season,
+                               get_all_division_winners, simulate_playoffs, TEAM_TO_DIVISION,
+-                              IN_SEASON_K, PRESEASON_K)
++                              IN_SEASON_K, PRESEASON_K, apply_elo_adjustments)
++from qb_out_2026 import qb_elo_adjustments
+ 
+ 
+ def run_superbowl_monte_carlo(target_season, n_sims=10000, use_played=False):
+     preseason_ratings = get_preseason_ratings(target_season)
+     schedule = get_season_schedule(target_season, include_played_results=use_played)
+     k = IN_SEASON_K if use_played else PRESEASON_K
++    # QB fuera por la temporada: solo en vivo (use_played=True); backtests sin cambios
++    elo_adjustments = qb_elo_adjustments(target_season) if use_played else {}
+ 
+     if use_played:
+         n_played = sum(1 for g in schedule if g.get("home_score") is not None)
+@@ -22,9 +25,9 @@
+     sb_wins = {team: 0 for team in TEAM_TO_DIVISION}
+ 
+     for _ in range(n_sims):
+-        records, final_elo = simulate_one_season(preseason_ratings, schedule, k=k)
++        records, final_elo = simulate_one_season(preseason_ratings, schedule, k=k, elo_adjustments=elo_adjustments)
+         division_winners = get_all_division_winners(records)
+-        sb_champion = simulate_playoffs(records, division_winners, final_elo)
++        sb_champion = simulate_playoffs(records, division_winners, apply_elo_adjustments(final_elo, elo_adjustments))
+         sb_wins[sb_champion] += 1
+ 
+     results = pl.DataFrame([
+--- a/conference_champions.py
++++ b/conference_champions.py
+@@ -8,7 +8,8 @@
+ import polars as pl
+ from season_sim_core import (get_preseason_ratings, get_season_schedule, simulate_one_season,
+                               get_all_division_winners, seed_conference, simulate_playoff_game,
+-                              TEAM_TO_DIVISION, IN_SEASON_K, PRESEASON_K)
++                              TEAM_TO_DIVISION, IN_SEASON_K, PRESEASON_K, apply_elo_adjustments)
++from qb_out_2026 import qb_elo_adjustments
+ 
+ 
+ def simulate_conference_champion(records, division_winners, final_elo, home_advantage=35, margin_std=13.5):
+@@ -37,6 +38,8 @@
+     preseason_ratings = get_preseason_ratings(target_season)
+     schedule = get_season_schedule(target_season, include_played_results=use_played)
+     k = IN_SEASON_K if use_played else PRESEASON_K
++    # QB fuera por la temporada: solo en vivo (use_played=True); backtests sin cambios
++    elo_adjustments = qb_elo_adjustments(target_season) if use_played else {}
+ 
+     if use_played:
+         n_played = sum(1 for g in schedule if g.get("home_score") is not None)
+@@ -45,9 +48,10 @@
+     conf_champ_wins = {team: 0 for team in TEAM_TO_DIVISION}
+ 
+     for _ in range(n_sims):
+-        records, final_elo = simulate_one_season(preseason_ratings, schedule, k=k)
++        records, final_elo = simulate_one_season(preseason_ratings, schedule, k=k, elo_adjustments=elo_adjustments)
+         division_winners = get_all_division_winners(records)
+-        conf_champs = simulate_conference_champion(records, division_winners, final_elo)
++        conf_champs = simulate_conference_champion(records, division_winners,
++                                                   apply_elo_adjustments(final_elo, elo_adjustments))
+         for winner in conf_champs.values():
+             conf_champ_wins[winner] += 1
+ 
+--- a/qb_out_2026.py
++++ b/qb_out_2026.py
+@@ -0,0 +1,64 @@
++"""
++QBs fuera POR EL RESTO DE LA TEMPORADA 2026 (estilo starters_2026.py), para el simulador
++de temporada en modo en vivo (use_played=True).
++
++QB_OUT_FOR_SEASON = {"EQUIPO": ("QB lesionado", "QB reemplazo")}, nombres como en el roster
++de nflreadpy. Vacio por defecto -> el simulador queda exactamente igual.
++
++La caida de valor (qb_value_epa_dropback del pipeline, valor antes de la temporada) se
++convierte a Elo con el b calibrado contra el mercado (experimentos/REPORTE_QB.md):
++  puntos de spread = B_SPREAD_PER_QB_VALUE * (valor_lesionado - valor_reemplazo)
++  puntos de Elo    = -25 * puntos de spread   (negativo = penalizacion)
++"""
++import nflreadpy as nfl
++import polars as pl
++from qb_adjustment import load_pbp_clean, qb_career_value, build_rookie_prior_baseline
++
++QB_OUT_FOR_SEASON = {
++    # "KC": ("Patrick Mahomes", "Justin Fields"),   # ejemplo
++}
++
++B_SPREAD_PER_QB_VALUE = 8.40   # spec (ii) 2010-2022, SE 0.79 (experimentos/qb_mercado.py)
++ELO_PER_POINT = 25.0
++VALUE_HISTORY_START = 2015
++
++
++def qb_elo_adjustments(season=2026, qb_out=None, verbose=True):
++    """dict equipo -> puntos de Elo para el simulador. Imprime cada ajuste aplicado."""
++    qb_out = QB_OUT_FOR_SEASON if qb_out is None else qb_out
++    if not qb_out:
++        return {}
++
++    pbp = load_pbp_clean(range(VALUE_HISTORY_START, season))
++    qb_values = qb_career_value(pbp)
++    picks = nfl.load_draft_picks()
++    rookie_baseline = build_rookie_prior_baseline(qb_values, picks)
++    rosters = nfl.load_rosters(seasons=[season]).filter(pl.col("position") == "QB")
++
++    def resolve(team, name):
++        m = rosters.filter((pl.col("team") == team) & (pl.col("full_name") == name))
++        if m.height == 0:
++            m = rosters.filter(pl.col("full_name") == name)
++        if m.height == 0:
++            raise ValueError(f"QB '{name}' ({team}) no encontrado en el roster {season}")
++        return m["gsis_id"][0]
++
++    def value(qb_id):
++        hist = qb_values.filter((pl.col("qb_id") == qb_id) & (pl.col("season") < season))
++        if hist.height > 0:
++            return hist.sort("season", descending=True)["qb_value_epa_dropback"][0]
++        pick = picks.filter((pl.col("gsis_id") == qb_id) & (pl.col("position") == "QB"))
++        rnd = pick["round"][0] if pick.height > 0 else None
++        bucket = "R1" if rnd == 1 else ("R2_R3" if rnd in (2, 3) else "R4_PLUS")
++        return rookie_baseline.filter(pl.col("bucket") == bucket)["baseline_value"][0]
++
++    adjustments = {}
++    for team, (out_name, repl_name) in qb_out.items():
++        v_out = value(resolve(team, out_name))
++        v_rep = value(resolve(team, repl_name))
++        spread_pts = B_SPREAD_PER_QB_VALUE * (v_out - v_rep)
++        adjustments[team] = -ELO_PER_POINT * spread_pts
++        if verbose:
++            print(f"(ajuste QB) {team}: {out_name} ({v_out:+.3f}) -> {repl_name} ({v_rep:+.3f}): "
++                  f"{-spread_pts:+.2f} pts de margen = {adjustments[team]:+.1f} Elo")
++    return adjustments

@@ -1,0 +1,106 @@
+--- a/weekly_pipeline.py
++++ b/weekly_pipeline.py
+@@ -8,16 +8,28 @@
+ import numpy as np
+ import polars as pl
+ import nflreadpy as nfl
++from scipy.stats import norm
+ from motor_elo_v1 import run_elo_over_seasons, normalize_team
+ from poisson_model import train_poisson_model, predict_lambda, game_win_probs, most_likely_scores
+ from team_epa import load_offensive_plays, season_final_epa, weekly_epa_with_blend
+ from poisson_features import (weekly_rush_epa_with_blend, weekly_pass_epa_with_blend,
+                               weekly_success_rate_with_blend, qb_value_live, backup_qb_flags)
+ from qb_adjustment import load_pbp_clean, qb_career_value, build_rookie_prior_baseline
++from market_lines_2026 import MARKET_SPREADS
+ 
+ POISSON_BLEND_WEIGHT = 0.45  # re-optimizado con el Poisson nuevo: walk-forward 2010-2022 (experimentos/REPORTE.md)
+ NEUTRAL_SITE_GAMES = {("PHI", "JAX")}  # (visita, local) de los partidos en campo neutral esta semana
+ HISTORY_START = 2015
++# Mezcla con el spread de Vegas (experimentos/REPORTE_MERCADO.md). Con lineas de cierre el
++# optimo es ~0.85 (curva monotona, 0.6 = borde de la grilla); 0.40 es conservador porque
++# el usuario pega lineas del martes, menos informadas que las de cierre.
++MARKET_BLEND_WEIGHT = 0.40
++MARKET_SPREAD_SIGMA = 11.13  # normal calibrada 2010-2025 (LOSO); mejor que la clasica 13.5
++
++
++def spread_to_prob(home_margin):
++    """P(local gana) dado el margen esperado del local segun Vegas (positivo = local favorito)."""
++    return float(norm.cdf(home_margin / MARKET_SPREAD_SIGMA))
+ POISSON_TRAIN_START = 2002   # ventana de entrenamiento evaluada en experimentos/
+ 
+ 
+@@ -237,13 +249,16 @@
+         lam_away = predict_lambda(poisson_model, away_row)
+         poisson_probs = game_win_probs(lam_home, lam_away)
+ 
+-        MARKET_BLEND_WEIGHT = 0.20  # validado: captura ~34-42% de la mejora disponible con Vegas
+         base_blend_prob_home = (POISSON_BLEND_WEIGHT * poisson_probs["home_win"] +
+                                  (1 - POISSON_BLEND_WEIGHT) * elo_prob_home)
+-        # Nota: aplicar esto solo tiene sentido si se corre cerca del kickoff
+-        # (jueves en adelante), momento en que Vegas ya incorpora reportes de
+-        # lesion de ultimo momento -- no a mitad de semana.
+-        blend_prob_home = base_blend_prob_home  # placeholder -- el peso de mercado se aplica en el pipeline semanal real con moneyline del partido especifico, no aqui en el backtest historico
++        market_spread = MARKET_SPREADS.get((away, home))  # margen esperado del local; None si no hay linea
++        if market_spread is not None:
++            prob_mercado_local = spread_to_prob(market_spread)
++            blend_prob_home = ((1 - MARKET_BLEND_WEIGHT) * base_blend_prob_home +
++                               MARKET_BLEND_WEIGHT * prob_mercado_local)
++        else:
++            prob_mercado_local = None
++            blend_prob_home = base_blend_prob_home
+ 
+         # Margen esperado: blend consistente con la probabilidad ya mostrada
+         # (mismo peso 0.45/0.55 que el blend de probabilidad), en vez de usar
+@@ -251,6 +266,8 @@
+         elo_margin = (elo_home - elo_away) / 25.0
+         poisson_margin = lam_home - lam_away
+         blend_margin = POISSON_BLEND_WEIGHT * poisson_margin + (1 - POISSON_BLEND_WEIGHT) * elo_margin
++        if market_spread is not None:  # mismo peso de mercado que la probabilidad
++            blend_margin = (1 - MARKET_BLEND_WEIGHT) * blend_margin + MARKET_BLEND_WEIGHT * market_spread
+ 
+         top_scores = most_likely_scores(lam_home, lam_away, top_n=3)
+         top_scores_str = " / ".join(f"{home} {h}-{a} {away}" for h, a, _ in top_scores)
+@@ -261,9 +278,10 @@
+             "prob_gana_visita": round(1 - blend_prob_home, 3),
+             "margen_esperado": f"{home} +{blend_margin:.1f}" if blend_margin > 0 else f"{away} +{-blend_margin:.1f}",
+             "marcadores_ilustrativos": top_scores_str,  # top-3, NO es "la" prediccion -- ver nota abajo
++            "prob_mercado_local": round(prob_mercado_local, 3) if prob_mercado_local is not None else None,
+         })
+ 
+-    return pl.DataFrame(results).sort("matchup")
++    return pl.DataFrame(results).with_columns(pl.col("prob_mercado_local").cast(pl.Float64)).sort("matchup")
+ 
+ 
+ if __name__ == "__main__":
+--- a/market_lines_2026.py
++++ b/market_lines_2026.py
+@@ -0,0 +1,29 @@
++"""
++Spreads de Vegas 2026, pegados a mano cada semana (estilo starters_2026.py).
++
++Convencion: MARKET_SPREADS[(visita, local)] = margen esperado del LOCAL.
++  positivo = favorece al local, negativo = favorece a la visita.
++  Ojo: Vegas publica la linea del lado de cada equipo. "ATL +6" (local perro de 6)
++  se escribe -6.0; "DAL -9.5" (local favorito de 9.5) se escribe +9.5.
++Equipos con el mismo codigo que nflreadpy (LA = Rams, LV, LAC, WAS...).
++Partidos sin linea -> el pipeline usa solo el modelo (Elo + Poisson).
++"""
++
++MARKET_SPREADS = {
++    # --- Semana 5 (lineas de mitad de semana) ---
++    ("BAL", "ATL"): -6.0,
++    ("BUF", "LA"): +2.5,
++    ("CHI", "GB"): -2.5,
++    ("CIN", "MIA"): -7.0,
++    ("CLE", "NYJ"): +2.5,   # orientacion por confirmar
++    ("DEN", "LAC"): -2.5,
++    ("DET", "ARI"): -5.5,
++    ("HOU", "TEN"): -6.0,
++    ("IND", "PIT"): +2.5,
++    ("LV", "NE"): +3.5,
++    ("MIN", "NO"): -1.5,
++    ("NYG", "WAS"): -3.0,
++    ("PHI", "JAX"): +6.5,   # campo neutral (Londres); la linea ya lo incorpora
++    ("SF", "SEA"): +3.0,
++    ("TB", "DAL"): +9.5,
++}

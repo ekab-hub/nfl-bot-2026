@@ -1,0 +1,175 @@
+{
+  "survivors": [
+    "C1a",
+    "C1b",
+    "C3b",
+    "C4c",
+    "C4d"
+  ],
+  "joints": {
+    "JOINT": {
+      "feats": [
+        "team_rush_epa",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "team_pass_epa",
+        "team_success",
+        "wind_obs",
+        "cold_obs",
+        "qb_value_live",
+        "backup_qb"
+      ],
+      "start": 2002,
+      "survivors": [
+        "C1a",
+        "C1b",
+        "C3b",
+        "C4c",
+        "C4d"
+      ]
+    },
+    "JOINT_PROD": {
+      "feats": [
+        "team_rush_epa",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "team_pass_epa",
+        "team_success",
+        "qb_value_live",
+        "backup_qb"
+      ],
+      "start": 2002,
+      "survivors": [
+        "C1a",
+        "C1b",
+        "C4c",
+        "C4d"
+      ]
+    }
+  },
+  "otros_finalistas": [
+    "S0",
+    "O1"
+  ],
+  "candidates": {
+    "C1a": {
+      "feats": [
+        "team_rush_epa",
+        "team_qb_value",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "team_pass_epa"
+      ],
+      "start": 2002
+    },
+    "C1b": {
+      "feats": [
+        "team_rush_epa",
+        "team_qb_value",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "team_success"
+      ],
+      "start": 2002
+    },
+    "C3b": {
+      "feats": [
+        "team_rush_epa",
+        "team_qb_value",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "wind_obs",
+        "cold_obs"
+      ],
+      "start": 2002
+    },
+    "C4c": {
+      "feats": [
+        "team_rush_epa",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "qb_value_live"
+      ],
+      "start": 2002
+    },
+    "C4d": {
+      "feats": [
+        "team_rush_epa",
+        "team_qb_value",
+        "opp_def_epa_allowed",
+        "is_home",
+        "div_game",
+        "backup_qb"
+      ],
+      "start": 2002
+    }
+  },
+  "w_sel": {
+    "S0": 0.3,
+    "C1a": 0.4,
+    "C1b": 0.4,
+    "C1c": 0.3,
+    "C2a": 0.3,
+    "C2b": 0.3,
+    "C2c": 0.35,
+    "C2d": 0.3,
+    "C2e": 0.3,
+    "C2f": 0.25,
+    "C3a": 0.3,
+    "C3b": 0.3,
+    "C4a": 0.3,
+    "C4b": 0.3,
+    "C4c": 0.4,
+    "C4d": 0.35,
+    "O1": 0.15,
+    "O2": 0.3,
+    "JOINT": 0.45,
+    "JOINT-sin-C1a": 0.45,
+    "JOINT-sin-C1b": 0.45,
+    "JOINT-sin-C3b": 0.45,
+    "JOINT-sin-C4c": 0.45,
+    "JOINT-sin-C4d": 0.45,
+    "JOINT_PROD": 0.45,
+    "JOINT_PROD-sin-C1a": 0.45,
+    "JOINT_PROD-sin-C1b": 0.45,
+    "JOINT_PROD-sin-C4c": 0.45,
+    "JOINT_PROD-sin-C4d": 0.45
+  },
+  "w_sel_base": {
+    "S0": 0.15,
+    "C1a": 0.3,
+    "C1b": 0.3,
+    "C1c": 0.3,
+    "C2a": 0.3,
+    "C2b": 0.3,
+    "C2c": 0.35,
+    "C2d": 0.3,
+    "C2e": 0.3,
+    "C2f": 0.3,
+    "C3a": 0.3,
+    "C3b": 0.3,
+    "C4a": 0.3,
+    "C4b": 0.3,
+    "C4c": 0.3,
+    "C4d": 0.3,
+    "O1": 0.3,
+    "O2": 0.3,
+    "JOINT": 0.3,
+    "JOINT-sin-C1a": 0.5,
+    "JOINT-sin-C1b": 0.45,
+    "JOINT-sin-C3b": 0.45,
+    "JOINT-sin-C4c": 0.45,
+    "JOINT-sin-C4d": 0.45,
+    "JOINT_PROD": 0.3,
+    "JOINT_PROD-sin-C1a": 0.5,
+    "JOINT_PROD-sin-C1b": 0.45,
+    "JOINT_PROD-sin-C4c": 0.45,
+    "JOINT_PROD-sin-C4d": 0.45
+  }
+}

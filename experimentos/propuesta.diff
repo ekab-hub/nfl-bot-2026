@@ -1,0 +1,437 @@
+--- a/team_epa.py
++++ b/team_epa.py
+@@ -32,14 +32,17 @@
+     deff = pbp_season.group_by("defteam").agg(pl.col("epa").mean().alias("def_epa_prior"))
+     return off.rename({"posteam": "team"}), deff.rename({"defteam": "team"})
+ 
+-def weekly_epa_with_blend(pbp: pl.DataFrame, season, prior_off, prior_def, decay=0.85, blend_games=8):
++def weekly_epa_with_blend(pbp: pl.DataFrame, season, prior_off, prior_def, decay=0.85, blend_games=8,
++                          extra_weeks=()):
+     """
+     Para cada semana de la temporada actual, calcula el EPA ofensivo/defensivo
+     de cada equipo usando SOLO semanas anteriores (sin leakage), con peso
+     exponencial por antiguedad, blendeado con el EPA final de la temporada previa.
++    extra_weeks: semanas SIN jugadas todavia para las que tambien se quiere el valor
++    (la semana a predecir en el pipeline semanal; sin esto no hay fila y cae a 0.0).
+     """
+     season_pbp = pbp.filter(pl.col("season") == season)
+-    weeks = sorted(season_pbp["week"].unique().to_list())
++    weeks = sorted(set(season_pbp["week"].unique().to_list()) | set(extra_weeks))
+     results = []
+ 
+     for wk in weeks:
+--- a/poisson_features.py
++++ b/poisson_features.py
+@@ -1,8 +1,10 @@
+ """
+ Construye la tabla de features por partido (formato largo: una fila por equipo-partido)
+ para alimentar el modelo Poisson de anotacion.
+-Combina: EPA de carrera (equipo), valor de QB (jugador, con shrinkage para novatos),
+-EPA defensivo del rival, y home field.
++Combina: EPA de carrera, EPA por dropback y success rate (equipo), valor de QB
++(jugador, con shrinkage para novatos, actualizado con su EPA de la temporada), marca de
++QB suplente, EPA defensivo del rival, y home field.
++Factores validados en experimentos/REPORTE.md.
+ """
+ import nflreadpy as nfl
+ import polars as pl
+@@ -15,39 +17,98 @@
+ def normalize_team(t):
+     return TEAM_MAP.get(t, t)
+ 
+-def weekly_rush_epa_with_blend(pbp: pl.DataFrame, season, decay=0.85, blend_games=8):
+-    """Igual logica que team_epa.weekly_epa_with_blend pero SOLO jugadas de carrera."""
+-    rush_pbp = pbp.filter(
+-        (pl.col("play_type") == "run") &
+-        pl.col("epa").is_not_null() &
+-        pl.col("posteam").is_not_null()
++def weekly_offense_stat_with_blend(pbp: pl.DataFrame, season, play_filter, value_col, out_col,
++                                   decay=0.85, blend_games=8, extra_weeks=()):
++    """Misma logica que team_epa.weekly_epa_with_blend, para cualquier stat ofensiva por jugada
++    (EPA de carrera, EPA por dropback, success rate) sobre el subconjunto `play_filter`."""
++    plays = pbp.filter(play_filter & pl.col(value_col).is_not_null() & pl.col("posteam").is_not_null())
++    season_plays = plays.filter(pl.col("season") == season)
++    prior_tbl = plays.filter(pl.col("season") == season - 1).group_by("posteam").agg(
++        pl.col(value_col).cast(pl.Float64).mean().alias("prior")
+     )
+-    season_rush = rush_pbp.filter(pl.col("season") == season)
+-    prior_rush = rush_pbp.filter(pl.col("season") == season - 1).group_by("posteam").agg(
+-        pl.col("epa").mean().alias("rush_epa_prior")
+-    )
+ 
+-    weeks = sorted(season_rush["week"].unique().to_list())
++    weeks = sorted(set(season_plays["week"].unique().to_list()) | set(extra_weeks))
+     results = []
+     for wk in weeks:
+-        past = season_rush.filter(pl.col("week") < wk)
+-        teams = sorted(set(season_rush["posteam"].to_list()))
++        past = season_plays.filter(pl.col("week") < wk)
++        teams = sorted(set(season_plays["posteam"].to_list()))
+         for team in teams:
+-            plays = past.filter(pl.col("posteam") == team)
+-            games_played = plays["week"].n_unique() if plays.height > 0 else 0
+-            if plays.height > 0:
+-                w = decay ** (wk - plays["week"].to_numpy())
+-                current = np.average(plays["epa"].to_numpy(), weights=w)
++            tp = past.filter(pl.col("posteam") == team)
++            games_played = tp["week"].n_unique() if tp.height > 0 else 0
++            if tp.height > 0:
++                w = decay ** (wk - tp["week"].to_numpy())
++                current = np.average(tp[value_col].cast(pl.Float64).to_numpy(), weights=w)
+             else:
+                 current = 0.0
+-            prior = prior_rush.filter(pl.col("posteam") == team)["rush_epa_prior"]
++            prior = prior_tbl.filter(pl.col("posteam") == team)["prior"]
+             prior = prior[0] if len(prior) > 0 else 0.0
+             blend_w = min(games_played / blend_games, 1.0)
+-            rush_final = blend_w * current + (1 - blend_w) * prior
+-            results.append({"season": season, "week": wk, "team": team, "rush_epa": rush_final})
++            results.append({"season": season, "week": wk, "team": team,
++                            out_col: blend_w * current + (1 - blend_w) * prior})
+     return pl.DataFrame(results)
+ 
+ 
++def weekly_rush_epa_with_blend(pbp: pl.DataFrame, season, decay=0.85, blend_games=8, extra_weeks=()):
++    """Igual logica que team_epa.weekly_epa_with_blend pero SOLO jugadas de carrera."""
++    return weekly_offense_stat_with_blend(pbp, season, pl.col("play_type") == "run", "epa", "rush_epa",
++                                          decay, blend_games, extra_weeks)
++
++
++def weekly_pass_epa_with_blend(pbp: pl.DataFrame, season, decay=0.85, blend_games=8, extra_weeks=()):
++    """EPA por dropback del ATAQUE (equipo, no QB): linea, receptores, esquema."""
++    return weekly_offense_stat_with_blend(pbp, season, pl.col("qb_dropback") == 1, "epa", "pass_epa",
++                                          decay, blend_games, extra_weeks)
++
++
++def weekly_success_rate_with_blend(pbp: pl.DataFrame, season, decay=0.85, blend_games=8, extra_weeks=()):
++    """Success rate (jugadas con EPA > 0) del ataque, carrera + pase."""
++    return weekly_offense_stat_with_blend(pbp, season, pl.lit(True), "success", "success_rate",
++                                          decay, blend_games, extra_weeks)
++
++
++QB_LIVE_PRIOR_DROPBACKS = 150  # peso del valor historico, en dropbacks equivalentes
++
++
++def qb_value_live(prior_value, qb_id, season_dropbacks: pl.DataFrame, week, decay=0.85):
++    """
++    Valor del QB actualizado con su EPA de la temporada en curso (semanas < week),
++    con decaimiento semanal: (150*prior + S) / (150 + N).
++    season_dropbacks: jugadas qb_dropback de la temporada (passer_player_id, week, qb_epa).
++    """
++    plays = season_dropbacks.filter((pl.col("passer_player_id") == qb_id) & (pl.col("week") < week))
++    if plays.height == 0:
++        return prior_value
++    w = decay ** (week - plays["week"].to_numpy())
++    s = float(np.sum(w * plays["qb_epa"].to_numpy()))
++    n = float(np.sum(w))
++    return (QB_LIVE_PRIOR_DROPBACKS * prior_value + s) / (QB_LIVE_PRIOR_DROPBACKS + n)
++
++
++def backup_qb_flags(games: pl.DataFrame, qb_cols=(("home_team", "home_qb_id"), ("away_team", "away_qb_id"))):
++    """
++    {(team, week): 1/0} -- 1 si el QB titular de ese partido NO es el lider de
++    titularidades del equipo en semanas anteriores de la temporada (empate -> el mas
++    reciente). Sin partidos previos -> 0.
++    """
++    by_team = {}
++    for row in games.sort("week").iter_rows(named=True):
++        for team_col, qb_col in qb_cols:
++            by_team.setdefault(row[team_col], []).append((row["week"], row[qb_col]))
++    flags = {}
++    for team, seq in by_team.items():
++        starts, last = {}, {}
++        for wk, qb in seq:
++            if starts:
++                lead = max(starts, key=lambda q: (starts[q], last[q]))
++                flags[(team, wk)] = int(qb is not None and qb != lead)
++            else:
++                flags[(team, wk)] = 0
++            if qb is not None:
++                starts[qb] = starts.get(qb, 0) + 1
++                last[qb] = wk
++    return flags
++
++
+ def build_game_features(seasons_to_build, pbp_history_start=2018):
+     """
+     Para cada temporada en seasons_to_build, arma la tabla de features por equipo-semana
+@@ -77,8 +138,13 @@
+             *season_final_epa(pbp_off.filter(pl.col("season") == season - 1))
+         )
+         rush = weekly_rush_epa_with_blend(pbp_off, season)
++        pass_epa = weekly_pass_epa_with_blend(pbp_off, season)
++        success = weekly_success_rate_with_blend(pbp_off, season)
++        season_db = pbp.filter((pl.col("season") == season) & (pl.col("qb_dropback") == 1) &
++                               pl.col("qb_epa").is_not_null() & pl.col("passer_player_id").is_not_null())
+ 
+         season_games = schedules.filter(pl.col("season") == season)
++        backup_flags = backup_qb_flags(season_games)
+ 
+         for row in season_games.iter_rows(named=True):
+             for side, team_col, qb_col, opp_col in [
+@@ -97,6 +163,10 @@
+ 
+                 rush_row = rush.filter((pl.col("team") == team) & (pl.col("week") == wk))
+                 team_rush_epa = rush_row["rush_epa"][0] if rush_row.height > 0 else 0.0
++                pass_row = pass_epa.filter((pl.col("team") == team) & (pl.col("week") == wk))
++                team_pass_epa = pass_row["pass_epa"][0] if pass_row.height > 0 else 0.0
++                succ_row = success.filter((pl.col("team") == team) & (pl.col("week") == wk))
++                team_success = succ_row["success_rate"][0] if succ_row.height > 0 else 0.0
+ 
+                 qb_id = row[qb_col]
+                 qb_hist = qb_values.filter((pl.col("qb_id") == qb_id) & (pl.col("season") < season))
+@@ -111,11 +181,14 @@
+                     else:
+                         bucket = "R4_PLUS"  # UDFA -> cubeta mas baja como default
+                     qb_val = rookie_baseline.filter(pl.col("bucket") == bucket)["baseline_value"][0]
++                qb_live = qb_value_live(qb_val, qb_id, season_db, wk)
+ 
+                 rows.append({
+                     "season": season, "week": wk, "game_id": row["game_id"],
+                     "team": team, "opponent": opp, "is_home": is_home,
+                     "team_rush_epa": team_rush_epa, "team_qb_value": qb_val,
++                    "team_pass_epa": team_pass_epa, "team_success": team_success,
++                    "qb_value_live": qb_live, "backup_qb": backup_flags.get((team, wk), 0),
+                     "opp_def_epa_allowed": opp_def_epa,
+                     "points_scored": row["home_score"] if side == "home" else row["away_score"],
+                     "div_game": row["div_game"],
+--- a/poisson_model.py
++++ b/poisson_model.py
+@@ -8,25 +8,36 @@
+ import numpy as np
+ import polars as pl
+ from sklearn.linear_model import PoissonRegressor
++from sklearn.pipeline import make_pipeline
++from sklearn.preprocessing import StandardScaler
+ from scipy.stats import skellam, poisson
+ from poisson_features import build_game_features
+ 
+-FEATURES = ["team_rush_epa", "team_qb_value", "opp_def_epa_allowed", "is_home", "div_game"]
++# Validado en experimentos/REPORTE.md (walk-forward 2010-2022 + holdout 2023-2025).
++# qb_value_live reemplaza a team_qb_value (lo contiene como prior).
++FEATURES = ["team_rush_epa", "team_pass_epa", "team_success", "qb_value_live", "backup_qb",
++            "opp_def_epa_allowed", "is_home", "div_game"]
+ TARGET = "points_scored"
+ 
+ 
+-def train_poisson_model(train_seasons, alpha=1.0, pbp_history_start=2018):
++def train_poisson_model(train_seasons, alpha=1e-4, pbp_history_start=2001):
++    """
++    Features estandarizadas + penalizacion casi nula. Antes: features crudas (escala ~0.1)
++    con alpha=1.0, que encogia los coeficientes de EPA ~6x hacia cero.
++    """
+     df = build_game_features(seasons_to_build=train_seasons, pbp_history_start=pbp_history_start)
++    df = df.filter(pl.col("game_id").str.contains(r"_(0[1-9]|1[0-8])_"))  # solo temporada regular
+     X = df.select(FEATURES).to_numpy()
+     y = df[TARGET].to_numpy()
+ 
+-    model = PoissonRegressor(alpha=alpha, max_iter=500)
++    model = make_pipeline(StandardScaler(), PoissonRegressor(alpha=alpha, max_iter=1000))
+     model.fit(X, y)
+     return model, df
+ 
+ 
+-def predict_lambda(model, team_rush_epa, team_qb_value, opp_def_epa_allowed, is_home, div_game=0):
+-    X = np.array([[team_rush_epa, team_qb_value, opp_def_epa_allowed, is_home, div_game]])
++def predict_lambda(model, features: dict):
++    """features: dict (o fila nombrada) con todas las columnas de FEATURES."""
++    X = np.array([[features[f] for f in FEATURES]])
+     return model.predict(X)[0]
+ 
+ 
+@@ -70,10 +81,8 @@
+         if home_row.height == 0 or away_row.height == 0:
+             continue
+ 
+-        lam_home = predict_lambda(model, home_row["team_rush_epa"][0], home_row["team_qb_value"][0],
+-                                   home_row["opp_def_epa_allowed"][0], 1, home_row["div_game"][0])
+-        lam_away = predict_lambda(model, away_row["team_rush_epa"][0], away_row["team_qb_value"][0],
+-                                   away_row["opp_def_epa_allowed"][0], 0, away_row["div_game"][0])
++        lam_home = predict_lambda(model, home_row.row(0, named=True))
++        lam_away = predict_lambda(model, away_row.row(0, named=True))
+ 
+         probs = game_win_probs(lam_home, lam_away)
+         actual_home_win = 1 if home_row["points_scored"][0] > away_row["points_scored"][0] else 0
+@@ -103,12 +112,13 @@
+ 
+ if __name__ == "__main__":
+     # Entrena con 2019-2023, evalua en 2024 (temporada que el modelo NUNCA vio)
+-    model, train_df = train_poisson_model(train_seasons=[2019, 2020, 2021, 2022, 2023])
++    model, train_df = train_poisson_model(train_seasons=list(range(2002, 2024)))
+ 
+-    print("Coeficientes del modelo (impacto de cada feature en log-lambda):")
+-    for f, coef in zip(FEATURES, model.coef_):
++    reg = model[-1]
++    print("Coeficientes (por 1 desviacion estandar de cada feature, en log-lambda):")
++    for f, coef in zip(FEATURES, reg.coef_):
+         print(f"  {f}: {coef:.4f}")
+-    print(f"  intercept: {model.intercept_:.4f}\n")
++    print(f"  intercept: {reg.intercept_:.4f}\n")
+ 
+     res_df = backtest_poisson(model, test_seasons=[2024])
+ 
+--- a/weekly_pipeline.py
++++ b/weekly_pipeline.py
+@@ -11,11 +11,13 @@
+ from motor_elo_v1 import run_elo_over_seasons, normalize_team
+ from poisson_model import train_poisson_model, predict_lambda, game_win_probs, most_likely_scores
+ from team_epa import load_offensive_plays, season_final_epa, weekly_epa_with_blend
+-from poisson_features import weekly_rush_epa_with_blend
++from poisson_features import (weekly_rush_epa_with_blend, weekly_pass_epa_with_blend,
++                              weekly_success_rate_with_blend, qb_value_live, backup_qb_flags)
+ from qb_adjustment import load_pbp_clean, qb_career_value, build_rookie_prior_baseline
+ 
+-POISSON_BLEND_WEIGHT = 0.25  # validado con walk-forward, 2021-2024 (weight_search.py)
++POISSON_BLEND_WEIGHT = 0.45  # re-optimizado con el Poisson nuevo: walk-forward 2010-2022 (experimentos/REPORTE.md)
+ HISTORY_START = 2015
++POISSON_TRAIN_START = 2002   # ventana de entrenamiento evaluada en experimentos/
+ 
+ 
+ def get_upcoming_week(season):
+@@ -30,7 +32,8 @@
+ 
+ def get_current_elo_ratings(season):
+     """Elo actualizado con todos los resultados reales ya jugados de la temporada."""
+-    _, engine = run_elo_over_seasons(range(HISTORY_START, season + 1), home_advantage=35)
++    _, engine = run_elo_over_seasons(range(HISTORY_START, season + 1), k=20, home_advantage=35,
++                                     regression_to_mean=0.40)
+     return dict(engine.ratings)
+ 
+ 
+@@ -69,8 +72,12 @@
+     season_has_pbp = pbp_off.filter(pl.col("season") == season).height > 0
+ 
+     if season_has_pbp:
+-        off_def = weekly_epa_with_blend(pbp_off, season, prior_off, prior_def)
+-        rush = weekly_rush_epa_with_blend(pbp_off, season)
++        # extra_weeks=[week]: la semana a predecir todavia no tiene jugadas; sin esto
++        # no habia fila para ella y TODAS las features de EPA caian al default 0.0.
++        off_def = weekly_epa_with_blend(pbp_off, season, prior_off, prior_def, extra_weeks=[week])
++        rush = weekly_rush_epa_with_blend(pbp_off, season, extra_weeks=[week])
++        pass_epa = weekly_pass_epa_with_blend(pbp_off, season, extra_weeks=[week])
++        success = weekly_success_rate_with_blend(pbp_off, season, extra_weeks=[week])
+     else:
+         # Pretemporada: cero snaps jugados de 2026 -> el EPA de cada equipo
+         # es 100% el prior de temporada pasada (equivalente matematico a
+@@ -94,18 +101,47 @@
+                          if prior_rush.filter(pl.col("posteam") == t).height > 0 else 0.0}
+             for t in teams
+         ])
++        prev = pbp_off.filter(pl.col("season") == season - 1)
++        prior_pass = prev.filter(pl.col("qb_dropback") == 1).group_by("posteam").agg(pl.col("epa").mean().alias("v"))
++        prior_succ = prev.group_by("posteam").agg(pl.col("success").cast(pl.Float64).mean().alias("v"))
++        def prior_of(tbl, t):
++            r = tbl.filter(pl.col("posteam") == t)["v"]
++            return r[0] if len(r) > 0 else 0.0
++        pass_epa = pl.DataFrame([{"season": season, "week": week, "team": t, "pass_epa": prior_of(prior_pass, t)}
++                                 for t in teams])
++        success = pl.DataFrame([{"season": season, "week": week, "team": t, "success_rate": prior_of(prior_succ, t)}
++                                for t in teams])
+ 
+     qb_values = qb_career_value(pbp)
+     picks = nfl.load_draft_picks()
+     rookie_baseline = build_rookie_prior_baseline(qb_values, picks)
+ 
++    # EPA del QB en la temporada en curso (semanas < week) y titularidades previas
++    season_db = pbp.filter((pl.col("season") == season) & (pl.col("qb_dropback") == 1) &
++                           pl.col("qb_epa").is_not_null() & pl.col("passer_player_id").is_not_null())
++    played = nfl.load_schedules(seasons=[season]).filter(
++        (pl.col("game_type") == "REG") & (pl.col("week") < week) & pl.col("home_score").is_not_null()
++    ).with_columns([
++        pl.col("home_team").map_elements(normalize_team, return_dtype=pl.Utf8).alias("home_team"),
++        pl.col("away_team").map_elements(normalize_team, return_dtype=pl.Utf8).alias("away_team"),
++    ])
++
+     rosters = nfl.load_rosters(seasons=[season])
+     qbs = rosters.filter(pl.col("position") == "QB").select(["team", "full_name", "gsis_id"])
+ 
+     def resolve_qb_id(team):
+         name = PROJECTED_STARTERS.get(team)
+         match = qbs.filter((pl.col("team") == team) & (pl.col("full_name") == name))
+-        return match["gsis_id"][0] if match.height > 0 else None
++        if match.height > 0:
++            return match["gsis_id"][0]
++        # Fallback: titular del ultimo partido jugado esta temporada (antes: None -> valor 0.0)
++        last = [(r["week"], r["home_qb_id"]) for r in played.iter_rows(named=True) if r["home_team"] == team] + \
++               [(r["week"], r["away_qb_id"]) for r in played.iter_rows(named=True) if r["away_team"] == team]
++        if last:
++            print(f"(aviso: '{name}' no esta en el roster de {team}; uso el ultimo titular real)")
++            return max(last)[1]
++        print(f"(aviso: sin QB resuelto para {team}; valor de QB = 0.0)")
++        return None
+ 
+     def get_qb_value(qb_id):
+         if qb_id is None:
+@@ -122,6 +158,16 @@
+         row = rookie_baseline.filter(pl.col("bucket") == bucket)
+         return row["baseline_value"][0] if row.height > 0 else 0.0
+ 
++    def is_backup(team, qb_id):
++        """1 si el titular proyectado no es el lider de titularidades del equipo en la temporada."""
++        rows_t = [(r["week"], r["home_qb_id"]) for r in played.iter_rows(named=True) if r["home_team"] == team] + \
++                 [(r["week"], r["away_qb_id"]) for r in played.iter_rows(named=True) if r["away_team"] == team]
++        if not rows_t or qb_id is None:
++            return 0
++        fake = pl.DataFrame({"week": [w for w, _ in rows_t] + [week], "home_team": [team] * (len(rows_t) + 1),
++                             "home_qb_id": [q for _, q in rows_t] + [qb_id]})
++        return backup_qb_flags(fake, qb_cols=(("home_team", "home_qb_id"),)).get((team, week), 0)
++
+     games = get_week_games(season, week)
+     rows = []
+     for g in games:
+@@ -133,6 +179,11 @@
+             rush_row = rush.filter((pl.col("team") == team) & (pl.col("week") == week))
+             team_rush_epa = rush_row["rush_epa"][0] if rush_row.height > 0 else 0.0
+ 
++            pass_row = pass_epa.filter((pl.col("team") == team) & (pl.col("week") == week))
++            team_pass_epa = pass_row["pass_epa"][0] if pass_row.height > 0 else 0.0
++            succ_row = success.filter((pl.col("team") == team) & (pl.col("week") == week))
++            team_success = succ_row["success_rate"][0] if succ_row.height > 0 else 0.0
++
+             qb_id = resolve_qb_id(team)
+             qb_val = get_qb_value(qb_id)
+ 
+@@ -140,7 +191,11 @@
+                 "home_team": g["home_team"], "away_team": g["away_team"], "div_game": g["div_game"],
+                 "side": side, "team": team,
+                 "team_rush_epa": team_rush_epa, "team_qb_value": qb_val,
++                "team_pass_epa": team_pass_epa, "team_success": team_success,
++                "qb_value_live": qb_value_live(qb_val, qb_id, season_db, week),
++                "backup_qb": is_backup(team, qb_id),
+                 "opp_def_epa_allowed": opp_def_epa,
++                "is_home": 1 if side == "home" else 0,
+             })
+ 
+     return pl.DataFrame(rows)
+@@ -156,7 +211,8 @@
+     print(f"Prediciendo temporada {season}, semana {week}...\n")
+ 
+     elo_ratings = get_current_elo_ratings(season)
+-    poisson_model, _ = train_poisson_model(train_seasons=range(2019, season))
++    poisson_model, _ = train_poisson_model(train_seasons=list(range(POISSON_TRAIN_START, season)),
++                                           pbp_history_start=POISSON_TRAIN_START - 1)
+     features = build_week_features(season, week)
+ 
+     results = []
+@@ -170,10 +226,8 @@
+         elo_away = elo_ratings.get(away, 1500)
+         elo_prob_home = 1.0 / (1.0 + 10 ** ((elo_away - elo_home) / 400.0))
+ 
+-        lam_home = predict_lambda(poisson_model, home_f["team_rush_epa"][0], home_f["team_qb_value"][0],
+-                                   home_f["opp_def_epa_allowed"][0], 1, div)
+-        lam_away = predict_lambda(poisson_model, away_f["team_rush_epa"][0], away_f["team_qb_value"][0],
+-                                   away_f["opp_def_epa_allowed"][0], 0, div)
++        lam_home = predict_lambda(poisson_model, home_f.row(0, named=True))
++        lam_away = predict_lambda(poisson_model, away_f.row(0, named=True))
+         poisson_probs = game_win_probs(lam_home, lam_away)
+ 
+         MARKET_BLEND_WEIGHT = 0.20  # validado: captura ~34-42% de la mejora disponible con Vegas
+@@ -185,7 +239,7 @@
+         blend_prob_home = base_blend_prob_home  # placeholder -- el peso de mercado se aplica en el pipeline semanal real con moneyline del partido especifico, no aqui en el backtest historico
+ 
+         # Margen esperado: blend consistente con la probabilidad ya mostrada
+-        # (mismo peso 0.25/0.75 que el blend de probabilidad), en vez de usar
++        # (mismo peso 0.45/0.55 que el blend de probabilidad), en vez de usar
+         # solo el margen implicito del Poisson (que generaba la inconsistencia).
+         elo_margin = (elo_home - elo_away) / 25.0
+         poisson_margin = lam_home - lam_away
